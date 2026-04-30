@@ -1,5 +1,5 @@
 "use client";
-import React, { useState, useRef, useCallback, useEffect } from "react";
+import React, { useState, useRef, useCallback, useEffect, memo } from "react";
 import { type Page, type Block, uid, iconBtnStyle } from "@/lib/data";
 
 const BLOCK_TYPES = [
@@ -29,6 +29,65 @@ function getBlockStyle(type: string): React.CSSProperties {
   }
 }
 
+// ─── Uncontrolled ContentEditable ────────────────────────────────────
+// Key insight: contentEditable must be "uncontrolled" — set initial value
+// via ref and read changes on blur/input, but NEVER re-render via dangerouslySetInnerHTML.
+
+interface EditableDivProps {
+  initialContent: string;
+  blockId: string;
+  placeholder: string;
+  style: React.CSSProperties;
+  onContentChange: (id: string, content: string) => void;
+  onKeyDown: (e: React.KeyboardEvent, id: string) => void;
+  registerRef: (id: string, el: HTMLElement | null) => void;
+}
+
+const EditableDiv = memo(function EditableDiv({ initialContent, blockId, placeholder, style, onContentChange, onKeyDown, registerRef }: EditableDivProps) {
+  const elRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef(initialContent);
+
+  // Set initial content only on mount
+  useEffect(() => {
+    if (elRef.current && elRef.current.textContent !== initialContent) {
+      elRef.current.textContent = initialContent;
+      contentRef.current = initialContent;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run on mount
+
+  // Register ref for external focus calls
+  useEffect(() => {
+    registerRef(blockId, elRef.current);
+    return () => registerRef(blockId, null);
+  }, [blockId, registerRef]);
+
+  const handleInput = useCallback(() => {
+    const text = elRef.current?.textContent || '';
+    contentRef.current = text;
+    onContentChange(blockId, text);
+  }, [blockId, onContentChange]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    onKeyDown(e, blockId);
+  }, [blockId, onKeyDown]);
+
+  return (
+    <div
+      ref={elRef}
+      contentEditable
+      suppressContentEditableWarning
+      data-placeholder={placeholder}
+      style={style}
+      onInput={handleInput}
+      onKeyDown={handleKeyDown}
+    />
+  );
+}, (prev, next) => {
+  // Only re-render if block type or id changes, NOT content
+  return prev.blockId === next.blockId && prev.style === next.style && prev.placeholder === next.placeholder;
+});
+
 interface BlockRowProps {
   block: Block;
   index: number;
@@ -40,12 +99,14 @@ interface BlockRowProps {
   registerRef: (id: string, el: HTMLElement | null) => void;
 }
 
-function BlockRow({ block, index, numberedIndex, onUpdate, onKeyDown, onToggleCheck, onToggleOpen, registerRef }: BlockRowProps) {
+const BlockRow = memo(function BlockRow({ block, numberedIndex, onUpdate, onKeyDown, onToggleCheck, onToggleOpen, registerRef }: BlockRowProps) {
   const [hovered, setHovered] = useState(false);
 
   if (block.type === 'divider') {
     return <div style={{ padding: '8px 0' }}><hr style={{ border: 'none', borderTop: '1px solid rgba(255,255,255,.1)' }} /></div>;
   }
+
+  const placeholder = block.type === 'h1' ? 'Başlık 1' : block.type === 'h2' ? 'Başlık 2' : block.type === 'h3' ? 'Başlık 3' : block.type === 'code' ? 'Kod yazın...' : 'Yazmaya başlayın veya / tuşuna basın...';
 
   if (block.type === 'callout') {
     return (
@@ -54,14 +115,14 @@ function BlockRow({ block, index, numberedIndex, onUpdate, onKeyDown, onToggleCh
         onMouseEnter={() => setHovered(true)} onMouseLeave={() => setHovered(false)}
       >
         <span style={{ fontSize: 20, lineHeight: '1.6' }}>{block.emoji || '💡'}</span>
-        <div
-          ref={el => registerRef(block.id, el)}
-          contentEditable suppressContentEditableWarning
-          data-placeholder="Bilgi kutusu..."
+        <EditableDiv
+          initialContent={block.content}
+          blockId={block.id}
+          placeholder="Bilgi kutusu..."
           style={getBlockStyle('paragraph')}
-          onInput={e => onUpdate(block.id, (e.target as HTMLElement).textContent || '')}
-          onKeyDown={e => onKeyDown(e, block.id)}
-          dangerouslySetInnerHTML={{ __html: block.content }}
+          onContentChange={onUpdate}
+          onKeyDown={onKeyDown}
+          registerRef={registerRef}
         />
       </div>
     );
@@ -93,23 +154,30 @@ function BlockRow({ block, index, numberedIndex, onUpdate, onKeyDown, onToggleCh
       {/* Drag handle */}
       <span style={{ opacity: hovered ? 0.4 : 0, fontSize: 14, cursor: 'grab', padding: '2px 4px', marginTop: 2, transition: 'opacity .15s', userSelect: 'none', color: 'var(--muted)' }}>⠿</span>
       {prefix}
-      <div
-        ref={el => registerRef(block.id, el)}
-        contentEditable suppressContentEditableWarning
-        data-placeholder={block.type === 'h1' ? 'Başlık 1' : block.type === 'h2' ? 'Başlık 2' : block.type === 'h3' ? 'Başlık 3' : block.type === 'code' ? 'Kod yazın...' : 'Yazmaya başlayın veya / tuşuna basın...'}
+      <EditableDiv
+        initialContent={block.content}
+        blockId={block.id}
+        placeholder={placeholder}
         style={{
           ...getBlockStyle(block.type),
           textDecoration: block.type === 'todo' && block.checked ? 'line-through' : undefined,
           opacity: block.type === 'todo' && block.checked ? 0.5 : 1,
           flex: 1,
         }}
-        onInput={e => onUpdate(block.id, (e.target as HTMLElement).textContent || '')}
-        onKeyDown={e => onKeyDown(e, block.id)}
-        dangerouslySetInnerHTML={{ __html: block.content }}
+        onContentChange={onUpdate}
+        onKeyDown={onKeyDown}
+        registerRef={registerRef}
       />
     </div>
   );
-}
+}, (prev, next) => {
+  // Re-render only when block identity/type/checked/open changes, NOT content
+  return prev.block.id === next.block.id
+    && prev.block.type === next.block.type
+    && prev.block.checked === next.block.checked
+    && prev.block.open === next.block.open
+    && prev.numberedIndex === next.numberedIndex;
+});
 
 // ─── Slash Command Menu ──────────────────────────────────────────────
 
@@ -152,6 +220,33 @@ function SlashMenu({ position, query, onSelect, onClose }: {
   );
 }
 
+// ─── Uncontrolled Title ──────────────────────────────────────────────
+
+const EditableTitle = memo(function EditableTitle({ initialTitle, onTitleChange }: {
+  initialTitle: string;
+  onTitleChange: (title: string) => void;
+}) {
+  const elRef = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    if (elRef.current && elRef.current.textContent !== initialTitle) {
+      elRef.current.textContent = initialTitle;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only on mount
+
+  return (
+    <h1
+      ref={elRef}
+      contentEditable
+      suppressContentEditableWarning
+      data-placeholder="Başlıksız"
+      style={{ fontSize: '2.5rem', fontWeight: 700, outline: 'none', marginTop: 8, letterSpacing: '-0.03em', lineHeight: 1.2, background: 'none', border: 'none', color: 'inherit', width: '100%' }}
+      onInput={() => onTitleChange(elRef.current?.textContent || '')}
+    />
+  );
+}, () => true); // Never re-render — fully uncontrolled
+
 // ─── Main Editor ─────────────────────────────────────────────────────
 
 interface BloktionEditorProps {
@@ -162,6 +257,9 @@ interface BloktionEditorProps {
 export default function BloktionEditor({ page, onPageUpdate }: BloktionEditorProps) {
   const [slashMenu, setSlashMenu] = useState<{ blockId: string; position: { top: number; left: number }; query: string } | null>(null);
   const blockRefs = useRef<Record<string, HTMLElement | null>>({});
+  // Keep a mutable ref to page so callbacks always see latest
+  const pageRef = useRef(page);
+  pageRef.current = page;
 
   const registerRef = useCallback((id: string, el: HTMLElement | null) => {
     blockRefs.current[id] = el;
@@ -175,6 +273,7 @@ export default function BloktionEditor({ page, onPageUpdate }: BloktionEditorPro
   }, []);
 
   const updateBlock = useCallback((id: string, content: string) => {
+    const p = pageRef.current;
     // Check for slash command
     if (content.startsWith('/')) {
       const el = blockRefs.current[id];
@@ -185,30 +284,31 @@ export default function BloktionEditor({ page, onPageUpdate }: BloktionEditorPro
       return;
     }
     setSlashMenu(null);
-    const updated = { ...page, blocks: page.blocks.map(b => b.id === id ? { ...b, content } : b) };
+    const updated = { ...p, blocks: p.blocks.map(b => b.id === id ? { ...b, content } : b) };
     onPageUpdate(updated);
-  }, [page, onPageUpdate]);
+  }, [onPageUpdate]);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent, blockId: string) => {
-    const idx = page.blocks.findIndex(b => b.id === blockId);
+    const p = pageRef.current;
+    const idx = p.blocks.findIndex(b => b.id === blockId);
     if (idx === -1) return;
 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       const newBlock: Block = { id: uid(), type: 'paragraph', content: '' };
-      const newBlocks = [...page.blocks];
+      const newBlocks = [...p.blocks];
       newBlocks.splice(idx + 1, 0, newBlock);
-      onPageUpdate({ ...page, blocks: newBlocks });
+      onPageUpdate({ ...p, blocks: newBlocks });
       focusBlock(newBlock.id);
     }
 
     if (e.key === 'Backspace') {
       const el = blockRefs.current[blockId];
-      if (el && el.textContent === '' && page.blocks.length > 1) {
+      if (el && el.textContent === '' && p.blocks.length > 1) {
         e.preventDefault();
-        const newBlocks = page.blocks.filter(b => b.id !== blockId);
-        onPageUpdate({ ...page, blocks: newBlocks });
-        if (idx > 0) focusBlock(page.blocks[idx - 1].id);
+        const newBlocks = p.blocks.filter(b => b.id !== blockId);
+        onPageUpdate({ ...p, blocks: newBlocks });
+        if (idx > 0) focusBlock(p.blocks[idx - 1].id);
       }
     }
 
@@ -216,42 +316,50 @@ export default function BloktionEditor({ page, onPageUpdate }: BloktionEditorPro
       const sel = window.getSelection();
       if (sel && sel.anchorOffset === 0) {
         e.preventDefault();
-        focusBlock(page.blocks[idx - 1].id);
+        focusBlock(p.blocks[idx - 1].id);
       }
     }
-    if (e.key === 'ArrowDown' && idx < page.blocks.length - 1) {
+    if (e.key === 'ArrowDown' && idx < p.blocks.length - 1) {
       e.preventDefault();
-      focusBlock(page.blocks[idx + 1].id);
+      focusBlock(p.blocks[idx + 1].id);
     }
 
     // Tab for indenting
     if (e.key === 'Tab') {
       e.preventDefault();
-      if (page.blocks[idx].type === 'paragraph') {
-        const newBlocks = [...page.blocks];
+      if (p.blocks[idx].type === 'paragraph') {
+        const newBlocks = [...p.blocks];
         newBlocks[idx] = { ...newBlocks[idx], type: 'bullet' };
-        onPageUpdate({ ...page, blocks: newBlocks });
+        onPageUpdate({ ...p, blocks: newBlocks });
       }
     }
-  }, [page, onPageUpdate, focusBlock]);
+  }, [onPageUpdate, focusBlock]);
 
   const handleSlashSelect = useCallback((type: string) => {
     if (!slashMenu) return;
+    const p = pageRef.current;
     const el = blockRefs.current[slashMenu.blockId];
     if (el) el.textContent = '';
-    const newBlocks = page.blocks.map(b => b.id === slashMenu.blockId ? { ...b, type: type as Block['type'], content: '' } : b);
-    onPageUpdate({ ...page, blocks: newBlocks });
+    const newBlocks = p.blocks.map(b => b.id === slashMenu.blockId ? { ...b, type: type as Block['type'], content: '' } : b);
+    onPageUpdate({ ...p, blocks: newBlocks });
     setSlashMenu(null);
     focusBlock(slashMenu.blockId);
-  }, [slashMenu, page, onPageUpdate, focusBlock]);
+  }, [slashMenu, onPageUpdate, focusBlock]);
 
   const toggleCheck = useCallback((id: string) => {
-    onPageUpdate({ ...page, blocks: page.blocks.map(b => b.id === id ? { ...b, checked: !b.checked } : b) });
-  }, [page, onPageUpdate]);
+    const p = pageRef.current;
+    onPageUpdate({ ...p, blocks: p.blocks.map(b => b.id === id ? { ...b, checked: !b.checked } : b) });
+  }, [onPageUpdate]);
 
   const toggleOpen = useCallback((id: string) => {
-    onPageUpdate({ ...page, blocks: page.blocks.map(b => b.id === id ? { ...b, open: !b.open } : b) });
-  }, [page, onPageUpdate]);
+    const p = pageRef.current;
+    onPageUpdate({ ...p, blocks: p.blocks.map(b => b.id === id ? { ...b, open: !b.open } : b) });
+  }, [onPageUpdate]);
+
+  const handleTitleChange = useCallback((title: string) => {
+    const p = pageRef.current;
+    onPageUpdate({ ...p, title });
+  }, [onPageUpdate]);
 
   let numberedCounter = 0;
 
@@ -260,12 +368,10 @@ export default function BloktionEditor({ page, onPageUpdate }: BloktionEditorPro
       {/* Page Icon & Title */}
       <div style={{ marginBottom: 24 }}>
         <span style={{ fontSize: 48 }}>{page.icon}</span>
-        <h1
-          contentEditable suppressContentEditableWarning
-          data-placeholder="Başlıksız"
-          style={{ fontSize: '2.5rem', fontWeight: 700, outline: 'none', marginTop: 8, letterSpacing: '-0.03em', lineHeight: 1.2, background: 'none', border: 'none', color: 'inherit', width: '100%' }}
-          onInput={e => onPageUpdate({ ...page, title: (e.target as HTMLElement).textContent || '' })}
-          dangerouslySetInnerHTML={{ __html: page.title }}
+        <EditableTitle
+          key={page.id}
+          initialTitle={page.title}
+          onTitleChange={handleTitleChange}
         />
       </div>
 

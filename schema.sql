@@ -374,7 +374,7 @@ UNION ALL
   SELECT
     'record'::text,
     r.id,
-    d.workspace_id,
+    db.workspace_id,
     r.title_text,
     db.icon,
     r.updated_at,

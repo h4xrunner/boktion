@@ -1,9 +1,9 @@
 "use client";
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   type Page, type Database, type Member, type AuditLog, type Automation, type Form, type Integration,
-  BOKTION_ICONS, iconBtnStyle, uid,
-  INITIAL_PAGES, INITIAL_DATABASES, INITIAL_MEMBERS, INITIAL_AUDIT_LOGS,
+  BOKTION_ICONS, iconBtnStyle,
+  INITIAL_DATABASES, INITIAL_MEMBERS, INITIAL_AUDIT_LOGS,
   INITIAL_AUTOMATIONS, INITIAL_FORMS, INITIAL_INTEGRATIONS,
 } from "@/lib/data";
 import BloktionEditor from "@/components/editor/bloktion-editor";
@@ -18,7 +18,7 @@ type NavSection = 'pages' | 'databases' | 'automations' | 'forms' | 'integration
 type ContentView = { type: 'page'; id: string } | { type: 'database'; id: string };
 
 export default function BoktionApp() {
-  const [pages, setPages] = useState<Page[]>(INITIAL_PAGES);
+  const [pages, setPages] = useState<Page[]>([]);
   const [databases, setDatabases] = useState<Database[]>(INITIAL_DATABASES);
   const [members] = useState<Member[]>(INITIAL_MEMBERS);
   const [auditLogs] = useState<AuditLog[]>(INITIAL_AUDIT_LOGS);
@@ -26,14 +26,55 @@ export default function BoktionApp() {
   const [forms] = useState<Form[]>(INITIAL_FORMS);
   const [integrations] = useState<Integration[]>(INITIAL_INTEGRATIONS);
 
-  const [currentView, setCurrentView] = useState<ContentView>({ type: 'page', id: 'p1' });
+  const [currentView, setCurrentView] = useState<ContentView | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [searchOpen, setSearchOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [extrasOpen, setExtrasOpen] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [expandedSections, setExpandedSections] = useState<Record<NavSection, boolean>>({
     pages: true, databases: true, automations: false, forms: false, integrations: false,
   });
+
+  // Debounce timer ref for block saves
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ─── Load pages from DB ─────────────────────────────────────
+
+  const loadPages = useCallback(async () => {
+    try {
+      const res = await fetch('/api/pages');
+      if (!res.ok) throw new Error('Failed to fetch pages');
+      const data: Page[] = await res.json();
+
+      if (data.length === 0) {
+        // No pages — run seed
+        const seedRes = await fetch('/api/seed');
+        const seedData = await seedRes.json();
+        if (seedData.seeded) {
+          // Reload after seed
+          const res2 = await fetch('/api/pages');
+          const data2: Page[] = await res2.json();
+          setPages(data2);
+          if (data2.length > 0) setCurrentView({ type: 'page', id: data2[0].id });
+        }
+      } else {
+        setPages(data);
+        if (!currentView && data.length > 0) {
+          setCurrentView({ type: 'page', id: data[0].id });
+        }
+      }
+    } catch (err) {
+      console.error('Failed to load pages:', err);
+    } finally {
+      setLoading(false);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    loadPages();
+  }, [loadPages]);
 
   // ─── ⌘K Shortcut ─────────────────────────────────────────────
 
@@ -48,33 +89,76 @@ export default function BoktionApp() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
+  // ─── Save blocks (debounced) ──────────────────────────────────
+
+  const saveBlocks = useCallback(async (pageId: string, blocks: Page['blocks']) => {
+    setSaving(true);
+    try {
+      await fetch(`/api/pages/${pageId}/blocks`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ blocks }),
+      });
+    } catch (err) {
+      console.error('Failed to save blocks:', err);
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+
+  const debouncedSaveBlocks = useCallback((pageId: string, blocks: Page['blocks']) => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => saveBlocks(pageId, blocks), 1000);
+  }, [saveBlocks]);
+
   // ─── Handlers ─────────────────────────────────────────────────
 
   const handlePageUpdate = useCallback((updated: Page) => {
-    setPages(prev => prev.map(p => p.id === updated.id ? { ...updated, updatedAt: new Date().toISOString().split('T')[0] } : p));
-  }, []);
+    setPages(prev => prev.map(p => p.id === updated.id ? updated : p));
+
+    // Debounced save blocks to DB
+    debouncedSaveBlocks(updated.id, updated.blocks);
+
+    // Save title/icon changes immediately
+    const original = pages.find(p => p.id === updated.id);
+    if (original && (original.title !== updated.title || original.icon !== updated.icon)) {
+      fetch(`/api/pages/${updated.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: updated.title, icon: updated.icon }),
+      }).catch(err => console.error('Failed to save page:', err));
+    }
+  }, [pages, debouncedSaveBlocks]);
 
   const handleDatabaseUpdate = useCallback((updated: Database) => {
     setDatabases(prev => prev.map(db => db.id === updated.id ? updated : db));
   }, []);
 
-  const addNewPage = useCallback(() => {
+  const addNewPage = useCallback(async () => {
     const icon = BOKTION_ICONS[Math.floor(Math.random() * BOKTION_ICONS.length)];
-    const newPage: Page = {
-      id: uid(), icon, title: 'Yeni Sayfa', parentId: null,
-      createdAt: new Date().toISOString().split('T')[0],
-      updatedAt: new Date().toISOString().split('T')[0],
-      blocks: [{ id: uid(), type: 'h1', content: '' }],
-      children: [],
-    };
-    setPages(prev => [...prev, newPage]);
-    setCurrentView({ type: 'page', id: newPage.id });
+    try {
+      const res = await fetch('/api/pages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'Yeni Sayfa', icon }),
+      });
+      const newPage: Page = await res.json();
+      setPages(prev => [...prev, newPage]);
+      setCurrentView({ type: 'page', id: newPage.id });
+    } catch (err) {
+      console.error('Failed to create page:', err);
+    }
   }, []);
 
-  const deletePage = useCallback((id: string) => {
-    setPages(prev => prev.filter(p => p.id !== id));
-    if (currentView.type === 'page' && currentView.id === id) {
-      setCurrentView({ type: 'page', id: pages[0]?.id || 'p1' });
+  const deletePage = useCallback(async (id: string) => {
+    try {
+      await fetch(`/api/pages/${id}`, { method: 'DELETE' });
+      setPages(prev => prev.filter(p => p.id !== id));
+      if (currentView?.type === 'page' && currentView.id === id) {
+        setCurrentView(pages.length > 1 ? { type: 'page', id: pages.find(p => p.id !== id)?.id || '' } : null);
+      }
+    } catch (err) {
+      console.error('Failed to delete page:', err);
     }
   }, [currentView, pages]);
 
@@ -84,16 +168,30 @@ export default function BoktionApp() {
 
   // ─── Current content ─────────────────────────────────────────
 
-  const currentPage = currentView.type === 'page' ? pages.find(p => p.id === currentView.id) : null;
-  const currentDatabase = currentView.type === 'database' ? databases.find(db => db.id === currentView.id) : null;
+  const currentPage = currentView?.type === 'page' ? pages.find(p => p.id === currentView.id) : null;
+  const currentDatabase = currentView?.type === 'database' ? databases.find(db => db.id === currentView.id) : null;
 
   // ─── Breadcrumb ───────────────────────────────────────────────
 
-  const breadcrumb = currentView.type === 'page' && currentPage
+  const breadcrumb = currentView?.type === 'page' && currentPage
     ? `${currentPage.icon} ${currentPage.title}`
-    : currentView.type === 'database' && currentDatabase
+    : currentView?.type === 'database' && currentDatabase
     ? `${currentDatabase.icon} ${currentDatabase.title}`
     : '';
+
+  // ─── Loading Screen ──────────────────────────────────────────
+
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', height: '100vh', alignItems: 'center', justifyContent: 'center', background: 'var(--background)', color: 'var(--foreground)' }}>
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ fontSize: 48, marginBottom: 16, animation: 'pulse 1.5s infinite' }}>📚</div>
+          <div style={{ fontSize: 18, fontWeight: 600, letterSpacing: '-0.01em' }}>Boktion</div>
+          <div style={{ fontSize: 13, color: 'var(--muted)', marginTop: 4 }}>Yükleniyor...</div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: 'flex', height: '100vh', background: 'var(--background)', color: 'var(--foreground)', overflow: 'hidden' }}>
@@ -143,7 +241,7 @@ export default function BoktionApp() {
                   key={p.id}
                   icon={p.icon}
                   title={p.title}
-                  active={currentView.type === 'page' && currentView.id === p.id}
+                  active={currentView?.type === 'page' && currentView.id === p.id}
                   pinned
                   onClick={() => setCurrentView({ type: 'page', id: p.id })}
                   onDelete={() => deletePage(p.id)}
@@ -155,7 +253,7 @@ export default function BoktionApp() {
                   key={p.id}
                   icon={p.icon}
                   title={p.title}
-                  active={currentView.type === 'page' && currentView.id === p.id}
+                  active={currentView?.type === 'page' && currentView.id === p.id}
                   onClick={() => setCurrentView({ type: 'page', id: p.id })}
                   onDelete={() => deletePage(p.id)}
                 />
@@ -174,7 +272,7 @@ export default function BoktionApp() {
                   key={db.id}
                   icon={db.icon}
                   title={db.title}
-                  active={currentView.type === 'database' && currentView.id === db.id}
+                  active={currentView?.type === 'database' && currentView.id === db.id}
                   onClick={() => setCurrentView({ type: 'database', id: db.id })}
                 />
               ))}
@@ -223,6 +321,7 @@ export default function BoktionApp() {
               >☰</button>
             )}
             <span style={{ fontSize: 14, color: 'var(--muted)' }}>{breadcrumb}</span>
+            {saving && <span style={{ fontSize: 11, color: '#7c6af7', animation: 'pulse 1s infinite' }}>💾 Kaydediliyor...</span>}
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -239,11 +338,19 @@ export default function BoktionApp() {
 
         {/* Content Area */}
         <div style={{ flex: 1, overflowY: 'auto' }}>
-          {currentView.type === 'page' && currentPage && (
-            <BloktionEditor page={currentPage} onPageUpdate={handlePageUpdate} />
+          {currentView?.type === 'page' && currentPage && (
+            <BloktionEditor key={currentPage.id} page={currentPage} onPageUpdate={handlePageUpdate} />
           )}
-          {currentView.type === 'database' && currentDatabase && (
+          {currentView?.type === 'database' && currentDatabase && (
             <BloktionDatabase database={currentDatabase} onDatabaseUpdate={handleDatabaseUpdate} />
+          )}
+          {!currentView && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--muted)' }}>
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>📄</div>
+                <div style={{ fontSize: 16 }}>Bir sayfa seçin veya yeni oluşturun</div>
+              </div>
+            </div>
           )}
         </div>
       </main>
